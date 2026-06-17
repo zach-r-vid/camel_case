@@ -59,6 +59,11 @@
   .scope.out .dur{color:var(--mag)}
 
   .knobwrap{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;min-width:140px}
+  .knobcol{display:flex;flex-direction:row;align-items:center;justify-content:center;gap:18px;flex-wrap:wrap}
+  .knob.hump::after{background:conic-gradient(from 225deg, var(--cyan) 0deg, var(--gold) var(--sweep,0deg), transparent var(--sweep,0deg) 270deg, transparent 270deg)}
+  .knob.hump{border-color:rgba(245,179,0,.5);box-shadow:0 0 0 6px rgba(245,179,0,.07), var(--glow) rgba(245,179,0,.4), inset 0 6px 16px rgba(0,0,0,.7)}
+  .knob.hump .ind{background:var(--gold);box-shadow:var(--glow) var(--gold)}
+  .kval.hv{color:var(--gold)}
   .klabel{font-size:11px;letter-spacing:2px;color:var(--mut);text-transform:uppercase}
   .knob{
     width:96px;height:96px;border-radius:50%;position:relative;cursor:ns-resize;touch-action:none;
@@ -131,12 +136,21 @@
         <canvas class="wave" id="waveIn"></canvas>
       </div>
 
-      <div class="knobwrap">
-        <div class="klabel">Silence</div>
-        <div class="knob" id="knob" role="slider" aria-label="Silence threshold" aria-valuemin="0" aria-valuemax="100" aria-valuenow="35" tabindex="0">
-          <div class="ind"></div>
+      <div class="knobcol">
+        <div class="knobwrap">
+          <div class="klabel">Silence</div>
+          <div class="knob" id="knob" role="slider" aria-label="Silence threshold" aria-valuemin="0" aria-valuemax="100" aria-valuenow="35" tabindex="0">
+            <div class="ind"></div>
+          </div>
+          <div class="kval" id="kval">ELIMINATED</div>
         </div>
-        <div class="kval" id="kval">ELIMINATED</div>
+        <div class="knobwrap">
+          <div class="klabel">bigHump</div>
+          <div class="knob hump" id="knob2" role="slider" aria-label="bigHump amount" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" tabindex="0">
+            <div class="ind"></div>
+          </div>
+          <div class="kval hv" id="kval2">FLAT</div>
+        </div>
       </div>
 
       <div class="scope out" id="scopeOut">
@@ -195,7 +209,7 @@
   const MG = () => getComputedStyle(document.documentElement).getPropertyValue('--mag').trim();
 
   let original = null, processed = null;
-  let knobVal = 35, mode = 'eliminate';
+  let knobVal = 35, humpVal = 0, mode = 'eliminate';
   let recomputeTimer = null;
 
   const thresholdDb = v => -58 + (v/100)*36;
@@ -241,6 +255,32 @@
       }
     }
     return out;
+  }
+
+  // ---- bigHump: 0 = bypass; ramps to normalization, then soft-limit + saturate (the hump grows) ----
+  function bigHump(buf, amount){
+    if(amount<=0) return buf;
+    const a=amount/100, ch=buf.numberOfChannels, N=buf.length;
+    let peak=0;
+    for(let c=0;c<ch;c++){ const d=buf.getChannelData(c); for(let i=0;i<N;i++){ const v=Math.abs(d[i]); if(v>peak)peak=v; } }
+    if(peak<1e-5) return buf;
+    const target=Math.pow(10,-0.5/20);                 // -0.5 dBFS ceiling
+    const cleanGain=target/peak;
+    const gain=1+(cleanGain-1)*Math.min(1,a/0.5);      // reach full normalization by 50%
+    const sat=Math.max(0,(a-0.5)/0.5);                 // saturation/loudness phase past 50%
+    const drive=1+sat*6;
+    const tanhD=Math.tanh(drive);
+    let np=0;
+    for(let c=0;c<ch;c++){
+      const d=buf.getChannelData(c);
+      for(let i=0;i<N;i++){
+        let v=d[i]*gain;
+        if(sat>0) v=Math.tanh(v*drive)/tanhD;
+        d[i]=v; const av=Math.abs(v); if(av>np)np=av;
+      }
+    }
+    if(np>0){ const g2=target/np; if(Math.abs(g2-1)>1e-3) for(let c=0;c<ch;c++){ const d=buf.getChannelData(c); for(let i=0;i<N;i++) d[i]*=g2; } }
+    return buf;
   }
 
   function draw(canvas, buf, color, refDur){
@@ -301,7 +341,7 @@
     setTimeout(()=>{
       const meta=detect(original, thresholdDb(knobVal));
       const regions = mode==='silence' ? meta.silR : meta.keepR;
-      processed = build(original, regions);
+      processed = bigHump(build(original, regions), humpVal);
       refresh();
       const inDur=original.length/original.sampleRate;
       const outDur=processed.length/processed.sampleRate;
@@ -345,6 +385,25 @@
   knob.addEventListener('keydown',e=>{
     if(e.key==='ArrowUp'||e.key==='ArrowRight'){setKnob(knobVal+4);e.preventDefault();}
     if(e.key==='ArrowDown'||e.key==='ArrowLeft'){setKnob(knobVal-4);e.preventDefault();}
+  });
+
+  // ---- bigHump knob ----
+  const knob2=$('knob2');
+  function setHump(v){
+    humpVal=Math.max(0,Math.min(100,v));
+    knob2.style.setProperty('--sweep',(humpVal/100*270)+'deg');
+    knob2.querySelector('.ind').style.setProperty('--rot',(-135+humpVal/100*270)+'deg');
+    knob2.setAttribute('aria-valuenow',Math.round(humpVal));
+    $('kval2').textContent = humpVal<1 ? 'FLAT' : humpVal<50 ? 'LIFTED' : humpVal<85 ? 'PLUMP' : 'MAX HUMP';
+    clearTimeout(recomputeTimer); recomputeTimer=setTimeout(reprocess,140);
+  }
+  let drag2=false,sY2=0,sV2=0;
+  knob2.addEventListener('pointerdown',e=>{drag2=true;sY2=e.clientY;sV2=humpVal;knob2.setPointerCapture(e.pointerId);});
+  knob2.addEventListener('pointermove',e=>{ if(drag2) setHump(sV2+(sY2-e.clientY)*0.6); });
+  knob2.addEventListener('pointerup',()=>drag2=false);
+  knob2.addEventListener('keydown',e=>{
+    if(e.key==='ArrowUp'||e.key==='ArrowRight'){setHump(humpVal+4);e.preventDefault();}
+    if(e.key==='ArrowDown'||e.key==='ArrowLeft'){setHump(humpVal-4);e.preventDefault();}
   });
 
   // ---- mode toggle ----
@@ -528,6 +587,7 @@
   // init
   applyModeLabels();
   setKnob(knobVal);
+  setHump(humpVal);
   window.addEventListener('resize',refresh);
   refresh();
 })();
